@@ -13,118 +13,119 @@ function run(cmd) {
   }
 }
 
-function runDiagnostics() {
-  const results = {};
-
-  results.ss_tlnp = run('ss -tlnp');
-  results.ufw_status = run('sudo ufw status verbose');
-  results.ufw_numbered = run('sudo ufw status numbered');
-  results.iptables_input = run('sudo iptables -L INPUT -n -v --line-numbers');
-  results.iptables_all = run('sudo iptables -L -n -v');
-  results.ip6tables_input = run('sudo ip6tables -L INPUT -n -v --line-numbers');
-  results.sshd_config_port = run("grep -i 'port' /etc/ssh/sshd_config 2>/dev/null || echo 'no port line'");
-  results.socket_override = run('cat /etc/systemd/system/ssh.socket.d/override.conf 2>/dev/null || echo "no override"');
-  results.systemctl_ssh = run('systemctl status ssh.socket ssh.service 2>&1 || true');
-  results.ip_addr = run('ip addr show');
-  results.route = run('ip route show default');
-  results.sshd_test = run('sudo sshd -T 2>&1 | head -20');
-  results.kernel_log = run('dmesg | tail -30 2>/dev/null || echo "no dmesg access"');
-
-  return results;
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
-function fixSsh(targetPort) {
-  const steps = [];
+// ============================================================
+// FIX SSH ON STARTUP
+// ============================================================
+function fixSshOnStartup() {
+  log('=== SSH FIX STARTING ===');
 
-  try {
-    const ufwCheck = run('sudo ufw status');
-    if (ufwCheck.output.includes('Status: active')) {
-      steps.push({ action: 'ufw_allow', result: run(`sudo ufw allow ${targetPort}/tcp`) });
-      steps.push({ action: 'ufw_reload', result: run('sudo ufw reload') });
-    }
-    steps.push({ action: 'ufw_status_after', result: run('sudo ufw status numbered') });
-  } catch (err) {
-    steps.push({ action: 'ufw_error', result: { ok: false, output: err.message } });
+  // Step 1: Check current sysctl bindv6only
+  log('--- Step 1: Check bindv6only ---');
+  const bindv6 = run('sysctl net.ipv6.bindv6only');
+  log(`bindv6only: ${bindv6.output}`);
+
+  // Step 2: Check current listening state
+  log('--- Step 2: Current SSH listeners ---');
+  const ssResult = run('ss -tlnp | grep -E "22222|:22\\b"');
+  log(`ss output: ${ssResult.output}`);
+
+  // Step 3: Force sshd to listen on BOTH IPv4 and IPv6 explicitly
+  // Write AddressFamily and ListenAddress lines to sshd_config
+  log('--- Step 3: Fix sshd_config to bind both IPv4 and IPv6 ---');
+
+  // Read current config
+  const readConfig = run('cat /etc/ssh/sshd_config');
+  if (!readConfig.ok) {
+    log(`FAILED to read sshd_config: ${readConfig.output}`);
+    return;
   }
 
-  try {
-    steps.push({ action: 'iptables_direct_allow', result: run(`sudo iptables -I INPUT 1 -p tcp --dport ${targetPort} -j ACCEPT`) });
-    steps.push({ action: 'ip6tables_direct_allow', result: run(`sudo ip6tables -I INPUT 1 -p tcp --dport ${targetPort} -j ACCEPT`) });
-  } catch (err) {
-    steps.push({ action: 'iptables_error', result: { ok: false, output: err.message } });
+  let config = readConfig.output;
+
+  // Ensure Port 22222 is set
+  if (/^\s*Port\s+/m.test(config)) {
+    config = config.replace(/^\s*Port\s+\d+/m, 'Port 22222');
+  } else {
+    config = `Port 22222\n${config}`;
   }
 
-  steps.push({ action: 'verify_ss', result: run('ss -tlnp | grep sshd') });
-  steps.push({ action: 'verify_iptables', result: run(`sudo iptables -L INPUT -n -v | grep ${targetPort}`) });
+  // Remove any existing AddressFamily and ListenAddress lines
+  config = config.replace(/^\s*AddressFamily\s+.*/gm, '');
+  config = config.replace(/^\s*ListenAddress\s+.*/gm, '');
 
-  return steps;
+  // Add explicit ListenAddress for both protocols AFTER Port line
+  config = config.replace(
+    /^(Port 22222)$/m,
+    'Port 22222\nAddressFamily any\nListenAddress 0.0.0.0\nListenAddress ::'
+  );
+
+  // Write it back
+  const writeResult = run(`echo '${config.replace(/'/g, "'\\''")}' | sudo tee /etc/ssh/sshd_config > /dev/null`);
+  log(`Write sshd_config: ${writeResult.ok ? 'OK' : writeResult.output}`);
+
+  // Step 4: Validate config
+  log('--- Step 4: Validate config ---');
+  const testResult = run('sudo sshd -t 2>&1');
+  log(`sshd -t: ${testResult.ok ? 'OK' : testResult.output}`);
+
+  if (!testResult.ok && testResult.output.length > 0) {
+    log('CONFIG VALIDATION FAILED - aborting restart');
+    return;
+  }
+
+  // Step 5: Restart ssh socket and service
+  log('--- Step 5: Restart SSH ---');
+  const daemonReload = run('sudo systemctl daemon-reload');
+  log(`daemon-reload: ${daemonReload.ok ? 'OK' : daemonReload.output}`);
+
+  const restartSocket = run('sudo systemctl restart ssh.socket');
+  log(`restart ssh.socket: ${restartSocket.ok ? 'OK' : restartSocket.output}`);
+
+  const restartSsh = run('sudo systemctl restart ssh');
+  log(`restart ssh: ${restartSsh.ok ? 'OK' : restartSsh.output}`);
+
+  // Step 6: Also ensure iptables allows port 22222 and port 22 directly
+  log('--- Step 6: Direct iptables rules ---');
+  const ipt4_22222 = run('sudo iptables -I INPUT 1 -p tcp --dport 22222 -j ACCEPT');
+  log(`iptables allow 22222: ${ipt4_22222.ok ? 'OK' : ipt4_22222.output}`);
+  const ipt6_22222 = run('sudo ip6tables -I INPUT 1 -p tcp --dport 22222 -j ACCEPT');
+  log(`ip6tables allow 22222: ${ipt6_22222.ok ? 'OK' : ipt6_22222.output}`);
+  const ipt4_22 = run('sudo iptables -I INPUT 1 -p tcp --dport 22 -j ACCEPT');
+  log(`iptables allow 22: ${ipt4_22.ok ? 'OK' : ipt4_22.output}`);
+  const ipt6_22 = run('sudo ip6tables -I INPUT 1 -p tcp --dport 22 -j ACCEPT');
+  log(`ip6tables allow 22: ${ipt6_22.ok ? 'OK' : ipt6_22.output}`);
+
+  // Step 7: Verify
+  log('--- Step 7: Verify ---');
+  const verifyResult = run('ss -tlnp | grep sshd');
+  log(`SSH listeners after fix: ${verifyResult.output}`);
+
+  const iptVerify = run('sudo iptables -L INPUT -n --line-numbers | head -10');
+  log(`iptables INPUT (first 10): ${iptVerify.output}`);
+
+  const effectivePort = run('sudo sshd -T 2>/dev/null | grep -E "^(port|listenaddress|addressfamily)"');
+  log(`sshd effective config: ${effectivePort.output}`);
+
+  log('=== SSH FIX COMPLETE ===');
 }
 
+// Run the fix immediately
+fixSshOnStartup();
+
+// Keep a simple server alive so PM2 doesn't restart
 const server = http.createServer((req, res) => {
-  const url = new URL(req.url, `http://localhost:${PORT}`);
-
-  if (url.pathname === '/diagnose') {
-    const results = runDiagnostics();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(results, null, 2));
-    return;
-  }
-
-  if (url.pathname === '/fix') {
-    const port = url.searchParams.get('port') || '22222';
-    const steps = fixSsh(port);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ targetPort: port, steps }, null, 2));
-    return;
-  }
-
-  if (url.pathname === '/run') {
-    const cmd = url.searchParams.get('cmd');
-    if (!cmd) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'cmd query param required' }));
-      return;
-    }
-    const result = run(cmd);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(result, null, 2));
-    return;
-  }
-
-  if (url.pathname === '/revert-to-22') {
-    const steps = [];
-    steps.push({ action: 'write_sshd_config', result: run("sudo sed -i 's/^Port .*/Port 22/' /etc/ssh/sshd_config || echo 'no port line to change'") });
-    steps.push({ action: 'remove_socket_override', result: run('sudo rm -f /etc/systemd/system/ssh.socket.d/override.conf') });
-    steps.push({ action: 'daemon_reload', result: run('sudo systemctl daemon-reload') });
-    steps.push({ action: 'restart_ssh_socket', result: run('sudo systemctl restart ssh.socket') });
-    steps.push({ action: 'ufw_allow_22', result: run('sudo ufw allow 22/tcp') });
-    steps.push({ action: 'ufw_reload', result: run('sudo ufw reload') });
-    steps.push({ action: 'iptables_allow_22', result: run('sudo iptables -I INPUT 1 -p tcp --dport 22 -j ACCEPT') });
-    steps.push({ action: 'ip6tables_allow_22', result: run('sudo ip6tables -I INPUT 1 -p tcp --dport 22 -j ACCEPT') });
-    steps.push({ action: 'verify', result: run('ss -tlnp | grep sshd') });
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ steps }, null, 2));
-    return;
-  }
-
-  res.writeHead(200, { 'Content-Type': 'text/html' });
-  res.end(`<h2>SSH Rescue Tool</h2>
-<ul>
-<li><a href="/diagnose">GET /diagnose</a> - Full diagnostics</li>
-<li><a href="/fix?port=22222">GET /fix?port=22222</a> - Fix firewall for port 22222</li>
-<li><a href="/revert-to-22">GET /revert-to-22</a> - Revert SSH back to port 22</li>
-<li>GET /run?cmd=COMMAND - Run arbitrary command</li>
-</ul>`);
+  const result = {};
+  result.ss = run('ss -tlnp | grep sshd');
+  result.iptables_head = run('sudo iptables -L INPUT -n --line-numbers | head -10');
+  result.sshd_effective = run('sudo sshd -T 2>/dev/null | grep -E "^(port|listenaddress|addressfamily)"');
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(result, null, 2));
 });
 
 server.listen(PORT, () => {
-  console.log(`SSH Rescue listening on port ${PORT}`);
-
-  console.log('\\n=== STARTUP DIAGNOSTICS ===');
-  const diag = runDiagnostics();
-  for (const [key, val] of Object.entries(diag)) {
-    console.log(`\\n--- ${key} ---`);
-    console.log(val.output);
-  }
-  console.log('\\n=== END STARTUP DIAGNOSTICS ===');
+  log(`SSH Rescue server alive on port ${PORT}`);
 });
